@@ -21,3 +21,18 @@ It needs more experiments.
 2024-05-04 Update: @xiaol hinted that the constant initialization of `base_weight` parameters can be a problem on MNIST.
 For now I've changed both the `base_weight` and `spline_scaler` matrices to be initialized with `kaiming_uniform_`, following `nn.Linear`'s initialization.
 It seems to work much much better on MNIST (~20% to ~97%), but I'm not sure if it's a good idea in general.
+
+## Grid extension
+
+`KANLinear`/`KAN` already support `update_grid`, which redistributes the existing grid points to better match the input distribution, but keeps `grid_size` fixed.
+
+This fork adds `extend_grid(x, new_grid_size, margin=0.01)`, which implements the "grid extension" technique from the original KAN paper: it changes `grid_size` itself (to a finer or coarser grid) while refitting the spline coefficients (via least squares, like `curve2coeff`) so the function represented by the layer is preserved. This lets you start training on a coarse, cheap grid and later refine it to a finer grid without losing what was learned, e.g.:
+
+```python
+model = KAN([2, 4, 1], grid_size=5)
+# ... train for a while ...
+model.extend_grid(x_sample, new_grid_size=10)
+# ... continue training with a finer grid ...
+```
+
+`x_sample` should be a representative batch of inputs to the model (`(batch_size, in_features)`); it's used both to evaluate the current spline function and to fit the new one, and is propagated layer by layer so every layer is refit against the inputs it actually sees.

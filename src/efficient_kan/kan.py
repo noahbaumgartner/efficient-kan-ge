@@ -214,6 +214,75 @@ class KANLinear(torch.nn.Module):
         self.grid.copy_(grid.T)
         self.spline_weight.data.copy_(self.curve2coeff(x, unreduced_spline_output))
 
+    @torch.no_grad()
+    def extend_grid(self, x: torch.Tensor, new_grid_size: int, margin=0.01):
+        """
+        Change the number of grid intervals (finer or coarser) while
+        preserving the function currently represented by this layer.
+
+        Unlike `update_grid`, which only repositions the existing grid
+        points, this changes `grid_size` itself: the spline is evaluated on
+        `x` under the old grid, a new grid with `new_grid_size` uniform
+        intervals is built over the range of `x`, and the spline
+        coefficients are refit (least squares) to match the old outputs on
+        the new grid. This mirrors the "grid extension" technique from the
+        original KAN paper, which allows training to start on a coarse grid
+        and progressively refine it without losing the learned function.
+
+        Args:
+            x (torch.Tensor): Sample input of shape (batch_size, in_features)
+                used to evaluate the current spline and fit the new one.
+            new_grid_size (int): Number of grid intervals for the new grid.
+            margin (float): Padding added to the range of `x` when building
+                the new grid.
+        """
+        assert x.dim() == 2 and x.size(1) == self.in_features
+
+        # Evaluate the current (pre-extension) spline function on x.
+        splines = self.b_splines(x)  # (batch, in, coeff)
+        splines = splines.permute(1, 0, 2)  # (in, batch, coeff)
+        orig_coeff = self.scaled_spline_weight  # (out, in, coeff)
+        orig_coeff = orig_coeff.permute(1, 2, 0)  # (in, coeff, out)
+        unreduced_spline_output = torch.bmm(splines, orig_coeff)  # (in, batch, out)
+        unreduced_spline_output = unreduced_spline_output.permute(
+            1, 0, 2
+        )  # (batch, in, out)
+
+        # Build a new uniform grid with `new_grid_size` intervals over the range of x.
+        x_sorted = torch.sort(x, dim=0)[0]
+        uniform_step = (x_sorted[-1] - x_sorted[0] + 2 * margin) / new_grid_size
+        grid = (
+            torch.arange(
+                new_grid_size + 1, dtype=torch.float32, device=x.device
+            ).unsqueeze(1)
+            * uniform_step
+            + x_sorted[0]
+            - margin
+        )
+        grid = torch.concatenate(
+            [
+                grid[:1]
+                - uniform_step
+                * torch.arange(self.spline_order, 0, -1, device=x.device).unsqueeze(1),
+                grid,
+                grid[-1:]
+                + uniform_step
+                * torch.arange(1, self.spline_order + 1, device=x.device).unsqueeze(1),
+            ],
+            dim=0,
+        )
+
+        self.grid_size = new_grid_size
+        self.register_buffer("grid", grid.T.contiguous())
+        self.spline_weight = torch.nn.Parameter(
+            self.curve2coeff(x, unreduced_spline_output)
+        )
+        if self.enable_standalone_scale_spline:
+            # The scaling has already been folded into unreduced_spline_output
+            # (via scaled_spline_weight) and hence into the refit spline_weight,
+            # so the scaler is reset to avoid applying it twice.
+            self.spline_scaler = torch.nn.Parameter(torch.ones_like(self.spline_scaler))
+
     def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
         """
         Compute the regularization loss.
@@ -283,3 +352,16 @@ class KAN(torch.nn.Module):
             layer.regularization_loss(regularize_activation, regularize_entropy)
             for layer in self.layers
         )
+
+    @torch.no_grad()
+    def extend_grid(self, x: torch.Tensor, new_grid_size: int, margin=0.01):
+        """
+        Extend (or coarsen) every layer's grid to `new_grid_size` intervals,
+        refitting each layer's spline coefficients to preserve the currently
+        learned function. `x` is propagated layer by layer so that each
+        layer is refit against the inputs it actually sees.
+        """
+        for layer in self.layers:
+            layer.extend_grid(x, new_grid_size, margin=margin)
+            x = layer(x)
+        self.grid_size = new_grid_size
