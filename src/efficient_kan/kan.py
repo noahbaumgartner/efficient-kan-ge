@@ -842,6 +842,17 @@ class KAN(torch.nn.Module):
             new_layer.spline_weight.data.copy_(layer.spline_weight[out_idx][:, in_idx, :])
             if layer.enable_standalone_scale_spline:
                 new_layer.spline_scaler.data.copy_(layer.spline_scaler[out_idx][:, in_idx])
+
+            # Carry over any edges already fixed via fix_symbolic()/auto_symbolic(),
+            # remapped from old to new (in, out) indices, so pruning after
+            # symbolification doesn't silently revert those edges to numeric.
+            new_layer.symbolic_mask.copy_(layer.symbolic_mask[out_idx][:, in_idx])
+            in_pos = {old: new for new, old in enumerate(in_idx)}
+            out_pos = {old: new for new, old in enumerate(out_idx)}
+            for (old_j, old_i), info in layer.symbolic_funs.items():
+                if old_j in out_pos and old_i in in_pos:
+                    new_layer.symbolic_funs[(out_pos[old_j], in_pos[old_i])] = info
+
             new_layers.append(new_layer)
 
         return KAN._from_layers(new_layers)
